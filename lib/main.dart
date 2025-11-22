@@ -9,7 +9,6 @@ import 'package:url_launcher/url_launcher.dart';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:async';
-import 'dart:isolate';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 void main() {
@@ -21,19 +20,13 @@ void main() {
       channelDescription: 'Servicio de escaneo en segundo plano',
       channelImportance: NotificationChannelImportance.HIGH,
       priority: NotificationPriority.HIGH,
-      iconData: const NotificationIconData(
-        resType: ResourceType.mipmap,
-        resPrefix: ResourcePrefix.ic,
-        name: 'launcher',
-      ),
     ),
     iosNotificationOptions: const IOSNotificationOptions(
       showNotification: true,
       playSound: false,
     ),
-    foregroundTaskOptions: const ForegroundTaskOptions(
-      interval: 5000,
-      isOnceEvent: false,
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.repeat(5000),
       autoRunOnBoot: true,
       allowWakeLock: true,
       allowWifiLock: true,
@@ -140,8 +133,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   StreamSubscription<List<ScanResult>>? scanSubscription;
   Timer? vibrationTimer;
   bool showPermissionsDialog = false;
+  Map<String, int> deviceRssiHistory = {}; // Historial de RSSI por dispositivo
+  Map<String, int> lastAnnouncementTime = {}; // Control de anuncios por dispositivo
 
-  static const int directionUpdateInterval = 2000;
+  static const int directionUpdateInterval = 500; // Medio segundo
   static const int deviceTimeoutMs = 10000;
 
   @override
@@ -175,20 +170,14 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await initializeTTS();
     await checkPermissions();
     await startBackgroundService();
-    
-    await Future.delayed(const Duration(milliseconds: 1));
-    if (mounted) {
-      await startScan();
-      await Future.delayed(const Duration(milliseconds: 1));
-      await stopScan();
-    }
+    // ELIMINADO: No iniciar escaneo automáticamente
   }
 
   Future<void> initializeTTS() async {
     await flutterTts.setLanguage("es-ES");
-    await flutterTts.setSpeechRate(0.5);
+    await flutterTts.setSpeechRate(0.7); // Más rápido
     await flutterTts.setVolume(1.0);
-    await flutterTts.setPitch(1.0);
+    await flutterTts.setPitch(1.1); // Tono ligeramente más alto para mejor claridad
   }
 
 
@@ -285,8 +274,32 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         isScanning = true;
       });
 
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
+      // Función interna para realizar escaneo ultra rápido
+      Future<void> performScan() async {
+        if (!isScanning) return;
+        
+        try {
+          // Escaneo MUY corto (200ms) para actualizaciones casi instantáneas
+          await FlutterBluePlus.startScan(timeout: const Duration(milliseconds: 200));
+          
+          // Esperar muy poco antes de reiniciar
+          await Future.delayed(const Duration(milliseconds: 50));
+          
+          // Reiniciar el escaneo inmediatamente si sigue activo
+          if (isScanning) {
+            performScan(); // Recursión para escaneo continuo
+          }
+        } catch (e) {
+          debugPrint('Error en ciclo de escaneo: $e');
+          if (isScanning) {
+            // Reintentar inmediatamente
+            await Future.delayed(const Duration(milliseconds: 50));
+            performScan();
+          }
+        }
+      }
 
+      // Escuchar resultados del escaneo continuamente
       scanSubscription = FlutterBluePlus.scanResults.listen((results) {
         for (ScanResult result in results) {
           if (result.device.platformName == 'Rastreador Sabueso') {
@@ -296,15 +309,21 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       });
 
+      // Iniciar el ciclo de escaneo ultra rápido
+      performScan();
+
       await startLocationUpdates();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Iniciando escaneo...')),
+          const SnackBar(content: Text('Escaneo ultra rápido iniciado')),
         );
       }
     } catch (e) {
       debugPrint('Error al iniciar escaneo: $e');
+      setState(() {
+        isScanning = false;
+      });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error al iniciar escaneo: $e')),
@@ -338,7 +357,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final deviceAddress = result.device.remoteId.toString();
     final rssi = result.rssi;
     final distance = calculateDistance(rssi);
-    final direction = getDirection(rssi);
+    
+    // Guardar RSSI anterior específico del dispositivo
+    final previousDeviceRssi = deviceRssiHistory[deviceAddress] ?? rssi;
+    deviceRssiHistory[deviceAddress] = rssi;
+    
+    final direction = getDirectionForDevice(rssi, previousDeviceRssi, deviceAddress);
     final savedName = getSavedDeviceName(deviceAddress);
 
     final device = DeviceData(
@@ -359,16 +383,28 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       }
     });
 
-    vibrateBasedOnDistance(distance);
+    vibrateBasedOnDistance(distance, deviceAddress: deviceAddress);
   }
 
   double calculateDistance(int rssi) {
+    // Ajustado para mejor precisión con ESP32
+    // txPower es la potencia de transmisión a 1 metro
     const int txPower = -59;
-    return pow(10.0, (txPower - rssi) / 20.0).toDouble();
+    const double n = 2.0; // Factor de propagación (2.0 = espacio libre)
+    
+    if (rssi == 0) {
+      return -1.0; // Distancia desconocida
+    }
+    
+    // Fórmula: d = 10 ^ ((txPower - rssi) / (10 * n))
+    final double ratio = (txPower - rssi) / (10.0 * n);
+    return pow(10.0, ratio).toDouble();
   }
 
-  String getDirection(int rssi) {
+  String getDirectionForDevice(int rssi, int previousDeviceRssi, String deviceAddress) {
     final currentTime = DateTime.now().millisecondsSinceEpoch;
+    
+    // Verificar si ha pasado suficiente tiempo para actualizar
     if (currentTime - lastDirectionUpdate < directionUpdateInterval) {
       return '';
     }
@@ -376,24 +412,29 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     lastDirectionUpdate = currentTime;
     String direction;
 
-    if (rssi > previousRssi + 8) {
-      direction = 'sigue avanzando';
-    } else if (rssi < previousRssi - 8) {
-      direction = 'Te estás alejando';
-    } else if (rssi > previousRssi + 3) {
-      direction = 'continúa';
-    } else if (rssi < previousRssi - 3) {
-      direction = 'Te alejas';
+    // Más sensible a cambios pequeños
+    final rssiDiff = rssi - previousDeviceRssi;
+    
+    if (rssiDiff > 5) {
+      direction = 'Acercándote, continúa';
+    } else if (rssiDiff < -5) {
+      direction = 'Te alejas, regresa';
+    } else if (rssiDiff > 2) {
+      direction = 'Bien, sigue así';
+    } else if (rssiDiff < -2) {
+      direction = 'Cambia de dirección';
+    } else if (rssiDiff >= -1 && rssiDiff <= 1) {
+      direction = 'Muy cerca';
     } else {
-      direction = 'Mantén esta dirección';
+      direction = 'Mantén rumbo';
     }
 
     previousRssi = rssi;
-    announceDirection(direction);
+    announceDirection(direction, deviceAddress: deviceAddress);
     return direction;
   }
 
-  void vibrateBasedOnDistance(double distance) {
+  void vibrateBasedOnDistance(double distance, {String? deviceAddress}) {
     if (!isScanning) {
       Vibration.cancel();
       return;
@@ -403,38 +444,60 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     String message;
 
     if (distance <= 0.5) {
-      pattern = [0, 200];
+      pattern = [0, 50, 50, 50]; // Vibración muy rápida
       message = 'Muy cerca';
     } else if (distance <= 1.0) {
       pattern = [0, 100, 100, 100];
-      message = 'A un metro';
+      message = 'Un metro';
     } else if (distance <= 2.0) {
-      pattern = [0, 200, 200, 200];
-      message = 'A dos metros';
+      pattern = [0, 150, 150, 150];
+      message = 'Dos metros';
     } else if (distance <= 3.0) {
-      pattern = [0, 300, 300, 300];
-      message = 'A tres metros';
+      pattern = [0, 200, 200, 200];
+      message = 'Tres metros';
     } else if (distance <= 4.0) {
-      pattern = [0, 400, 400, 400];
-      message = 'A cuatro metros';
+      pattern = [0, 250, 250, 250];
+      message = 'Cuatro metros';
     } else if (distance <= 6.0) {
-      pattern = [0, 500, 500, 500];
-      message = 'A seis metros';
+      pattern = [0, 300, 300, 300];
+      message = 'Seis metros';
+    } else if (distance <= 10.0) {
+      pattern = [0, 400, 400, 400];
+      message = 'Diez metros';
     } else {
-      Vibration.cancel();
+      // No vibrar si está muy lejos
       return;
     }
 
-    Vibration.vibrate(pattern: pattern, repeat: 0);
-    announceDistance(message);
+    // Vibrar con patrón corto para respuesta rápida
+    Vibration.vibrate(pattern: pattern);
+    announceDistance(message, deviceAddress: deviceAddress);
   }
 
-  void announceDistance(String message) {
-    flutterTts.speak(message);
+  void announceDistance(String message, {String? deviceAddress}) {
+    // Control de tiempo para evitar spam de voz
+    final currentTime = DateTime.now().millisecondsSinceEpoch;
+    final key = deviceAddress ?? 'general';
+    final lastTime = lastAnnouncementTime[key] ?? 0;
+    
+    // Anunciar cada medio segundo para actualizaciones rápidas
+    if (currentTime - lastTime >= 500) {
+      flutterTts.speak(message);
+      lastAnnouncementTime[key] = currentTime;
+    }
   }
 
-  void announceDirection(String direction) {
-    flutterTts.speak(direction);
+  void announceDirection(String direction, {String? deviceAddress}) {
+    // Control de tiempo para evitar spam de voz
+    final currentTime = DateTime.now().millisecondsSinceEpoch;
+    final key = deviceAddress ?? 'general_direction';
+    final lastTime = lastAnnouncementTime[key] ?? 0;
+    
+    // Anunciar cada medio segundo para actualizaciones rápidas
+    if (currentTime - lastTime >= 500) {
+      flutterTts.speak(direction);
+      lastAnnouncementTime[key] = currentTime;
+    }
   }
 
   Future<void> startLocationUpdates() async {
@@ -874,17 +937,17 @@ void startBackgroundCallback() {
 
 class BackgroundTaskHandler extends TaskHandler {
   @override
-  Future<void> onStart(DateTime timestamp, SendPort? sendPort) async {
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
     debugPrint('Background service started');
   }
 
   @override
-  void onRepeatEvent(DateTime timestamp, SendPort? sendPort) {
+  Future<void> onRepeatEvent(DateTime timestamp) async {
     debugPrint('Background task repeat event');
   }
 
   @override
-  Future<void> onDestroy(DateTime timestamp, SendPort? sendPort) async {
+  Future<void> onDestroy(DateTime timestamp) async {
     debugPrint('Background service destroyed');
   }
 }
