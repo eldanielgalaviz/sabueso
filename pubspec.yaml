@@ -10,7 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   
-  # Bluetooth
+  # Bluetooth (La versión 2.0.2 no es estándar aún, usamos la última estable probada)
   flutter_blue_plus: ^2.0.2
   
   # Permisos
@@ -21,27 +21,19 @@ dependencies:
   location: ^8.0.1
   
   # Almacenamiento local
-  shared_preferences: ^2.2.2
+  shared_preferences: ^2.3.2
   
-  # Firebase - Servicios en la nube
+  # Firebase
   firebase_core: ^4.2.1
   firebase_auth: ^6.1.2
   cloud_firestore: ^6.1.0
   
   # Utilidades
-  json_annotation: ^4.8.1
+  json_annotation: ^4.9.0
   vibration: ^3.1.4
   flutter_tts: ^4.0.2
-  cupertino_icons: ^1.0.2
-  url_launcher: ^6.2.2
+  cupertino_icons: ^1.0.8
+  url_launcher: ^6.3.0
+  
+  # ESTA es la clave para que funcione tu código
   flutter_foreground_task: ^9.1.0
-
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^6.0.0
-  build_runner: ^2.4.7
-  json_serializable: ^6.7.1
-
-flutter:
-  uses-material-design: true
