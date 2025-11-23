@@ -1,5 +1,5 @@
 name: sabueso
-description: Rastreador Bluetooth BLE multiplataforma
+description: Rastreador Bluetooth BLE multiplataforma con Firebase
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -10,22 +10,36 @@ dependencies:
   flutter:
     sdk: flutter
   
-  flutter_blue_plus: ^1.36.8
-  permission_handler: ^11.4.0
-  geolocator: ^10.1.1
-  location: ^5.0.3
+  # Bluetooth
+  flutter_blue_plus: ^2.0.2
+  
+  # Permisos
+  permission_handler: ^12.0.1
+  
+  # Ubicación
+  geolocator: ^14.0.2
+  location: ^8.0.1
+  
+  # Almacenamiento local
   shared_preferences: ^2.2.2
+  
+  # Firebase - Servicios en la nube
+  firebase_core: ^4.2.1
+  firebase_auth: ^6.1.2
+  cloud_firestore: ^6.1.0
+  
+  # Utilidades
   json_annotation: ^4.8.1
-  vibration: ^2.0.0  # Actualizada a v2
-  flutter_tts: ^4.0.2  # Actualizada
+  vibration: ^3.1.4
+  flutter_tts: ^4.0.2
   cupertino_icons: ^1.0.2
   url_launcher: ^6.2.2
-  flutter_foreground_task: ^8.0.0  # Actualizada
+  flutter_foreground_task: ^9.1.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^3.0.0
+  flutter_lints: ^6.0.0
   build_runner: ^2.4.7
   json_serializable: ^6.7.1
 
