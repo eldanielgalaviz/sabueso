@@ -6,13 +6,27 @@ import 'package:geolocator/geolocator.dart';
 import 'package:vibration/vibration.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart'; // ✅ Este archivo se crea con flutterfire configure
+import 'firebase_service.dart';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:async';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  
+  // Inicializar Firebase
+  try {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+    debugPrint('✅ Firebase inicializado correctamente');
+  } catch (e) {
+    debugPrint('❌ Error al inicializar Firebase: $e');
+  }
+  
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
       channelId: 'sabueso_channel',
@@ -20,14 +34,20 @@ void main() {
       channelDescription: 'Servicio de escaneo en segundo plano',
       channelImportance: NotificationChannelImportance.HIGH,
       priority: NotificationPriority.HIGH,
+      icon: const NotificationIconData( // ✅ CORREGIDO
+        resType: ResourceType.mipmap,
+        resPrefix: ResourcePrefix.ic,
+        name: 'launcher',
+      ),
     ),
     iosNotificationOptions: const IOSNotificationOptions(
       showNotification: true,
       playSound: false,
     ),
-    foregroundTaskOptions: ForegroundTaskOptions(
+    foregroundTaskOptions: ForegroundTaskOptions( // ✅ CORREGIDO
       eventAction: ForegroundTaskEventAction.repeat(5000),
       autoRunOnBoot: true,
+      autoRunOnMyPackageReplaced: true,
       allowWakeLock: true,
       allowWifiLock: true,
     ),
@@ -49,34 +69,6 @@ class MyApp extends StatelessWidget {
       home: const MainScreen(),
     );
   }
-}
-
-class LocationRecord {
-  final double latitude;
-  final double longitude;
-  final int timestamp;
-  final String deviceAddress;
-
-  LocationRecord({
-    required this.latitude,
-    required this.longitude,
-    required this.timestamp,
-    required this.deviceAddress,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'latitude': latitude,
-        'longitude': longitude,
-        'timestamp': timestamp,
-        'deviceAddress': deviceAddress,
-      };
-
-  factory LocationRecord.fromJson(Map<String, dynamic> json) => LocationRecord(
-        latitude: json['latitude'],
-        longitude: json['longitude'],
-        timestamp: json['timestamp'],
-        deviceAddress: json['deviceAddress'],
-      );
 }
 
 class DeviceData {
@@ -120,11 +112,12 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   final FlutterTts flutterTts = FlutterTts();
-
+  final FirebaseLocationService _firebaseService = FirebaseLocationService();
 
   List<DeviceData> devicesList = [];
   List<LocationRecord> locationHistory = [];
   bool isScanning = false;
+  bool isSyncing = false;
   int previousRssi = 0;
   int lastDirectionUpdate = 0;
   int lastDeviceDetectionTime = 0;
@@ -132,12 +125,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   StreamSubscription<Position>? positionStream;
   StreamSubscription<List<ScanResult>>? scanSubscription;
   Timer? vibrationTimer;
+  Timer? autoSyncTimer;
   bool showPermissionsDialog = false;
-  Map<String, int> deviceRssiHistory = {}; // Historial de RSSI por dispositivo
-  Map<String, int> lastAnnouncementTime = {}; // Control de anuncios por dispositivo
 
-  static const int directionUpdateInterval = 500; // Medio segundo
+  static const int directionUpdateInterval = 2000;
   static const int deviceTimeoutMs = 10000;
+  static const int autoSyncIntervalMinutes = 30;
 
   @override
   void initState() {
@@ -152,6 +145,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     stopScan();
     stopLocationUpdates();
     vibrationTimer?.cancel();
+    autoSyncTimer?.cancel();
     flutterTts.stop();
     saveLocationHistory();
     super.dispose();
@@ -161,6 +155,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused) {
       saveLocationHistory();
+      syncWithFirebase();
     }
   }
 
@@ -170,22 +165,74 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await initializeTTS();
     await checkPermissions();
     await startBackgroundService();
-    // ELIMINADO: No iniciar escaneo automáticamente
+    
+    startAutoSync();
+    await syncWithFirebase();
+    
+    await Future.delayed(const Duration(milliseconds: 1));
+    if (mounted) {
+      await startScan();
+      await Future.delayed(const Duration(milliseconds: 1));
+      await stopScan();
+    }
   }
 
   Future<void> initializeTTS() async {
     await flutterTts.setLanguage("es-ES");
-    await flutterTts.setSpeechRate(0.7); // Más rápido
+    await flutterTts.setSpeechRate(0.5);
     await flutterTts.setVolume(1.0);
-    await flutterTts.setPitch(1.1); // Tono ligeramente más alto para mejor claridad
+    await flutterTts.setPitch(1.0);
   }
 
+  void startAutoSync() {
+    autoSyncTimer = Timer.periodic(
+      const Duration(minutes: autoSyncIntervalMinutes),
+      (_) => syncWithFirebase(),
+    );
+  }
 
+  Future<void> syncWithFirebase() async {
+    if (isSyncing || locationHistory.isEmpty) return;
+
+    setState(() {
+      isSyncing = true;
+    });
+
+    try {
+      await _firebaseService.syncLocalLocations(locationHistory);
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('✅ ${locationHistory.length} ubicaciones sincronizadas'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error en sincronización: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('❌ Error al sincronizar con Firebase'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      setState(() {
+        isSyncing = false;
+      });
+    }
+  }
 
   Future<void> startBackgroundService() async {
     await FlutterForegroundTask.startService(
+      serviceId: 256, // ✅ AGREGADO
       notificationTitle: 'Sabueso',
       notificationText: 'Escaneando dispositivos...',
+      notificationIcon: null, // ✅ AGREGADO
+      notificationButtons: [], // ✅ AGREGADO
       callback: startBackgroundCallback,
     );
   }
@@ -239,9 +286,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     try {
       final jsonList = locationHistory.map((e) => e.toJson()).toList();
       await prefs?.setString('location_history', jsonEncode(jsonList));
-      debugPrint('Guardado exitoso: ${locationHistory.length} registros');
+      debugPrint('Guardado local exitoso: ${locationHistory.length} registros');
     } catch (e) {
-      debugPrint('Error al guardar el historial: $e');
+      debugPrint('Error al guardar el historial local: $e');
     }
   }
 
@@ -254,10 +301,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           locationHistory =
               decoded.map((e) => LocationRecord.fromJson(e)).toList();
         });
-        debugPrint('Historial cargado: ${locationHistory.length} registros');
+        debugPrint('Historial local cargado: ${locationHistory.length} registros');
       }
     } catch (e) {
-      debugPrint('Error al cargar el historial: $e');
+      debugPrint('Error al cargar el historial local: $e');
     }
   }
 
@@ -274,32 +321,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         isScanning = true;
       });
 
-      // Función interna para realizar escaneo ultra rápido
-      Future<void> performScan() async {
-        if (!isScanning) return;
-        
-        try {
-          // Escaneo MUY corto (200ms) para actualizaciones casi instantáneas
-          await FlutterBluePlus.startScan(timeout: const Duration(milliseconds: 200));
-          
-          // Esperar muy poco antes de reiniciar
-          await Future.delayed(const Duration(milliseconds: 50));
-          
-          // Reiniciar el escaneo inmediatamente si sigue activo
-          if (isScanning) {
-            performScan(); // Recursión para escaneo continuo
-          }
-        } catch (e) {
-          debugPrint('Error en ciclo de escaneo: $e');
-          if (isScanning) {
-            // Reintentar inmediatamente
-            await Future.delayed(const Duration(milliseconds: 50));
-            performScan();
-          }
-        }
-      }
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
 
-      // Escuchar resultados del escaneo continuamente
       scanSubscription = FlutterBluePlus.scanResults.listen((results) {
         for (ScanResult result in results) {
           if (result.device.platformName == 'Rastreador Sabueso') {
@@ -309,21 +332,15 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       });
 
-      // Iniciar el ciclo de escaneo ultra rápido
-      performScan();
-
       await startLocationUpdates();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Escaneo ultra rápido iniciado')),
+          const SnackBar(content: Text('Iniciando escaneo...')),
         );
       }
     } catch (e) {
       debugPrint('Error al iniciar escaneo: $e');
-      setState(() {
-        isScanning = false;
-      });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error al iniciar escaneo: $e')),
@@ -343,6 +360,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         isScanning = false;
       });
 
+      await syncWithFirebase();
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Escaneo detenido')),
@@ -357,12 +376,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final deviceAddress = result.device.remoteId.toString();
     final rssi = result.rssi;
     final distance = calculateDistance(rssi);
-    
-    // Guardar RSSI anterior específico del dispositivo
-    final previousDeviceRssi = deviceRssiHistory[deviceAddress] ?? rssi;
-    deviceRssiHistory[deviceAddress] = rssi;
-    
-    final direction = getDirectionForDevice(rssi, previousDeviceRssi, deviceAddress);
+    final direction = getDirection(rssi);
     final savedName = getSavedDeviceName(deviceAddress);
 
     final device = DeviceData(
@@ -383,28 +397,16 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       }
     });
 
-    vibrateBasedOnDistance(distance, deviceAddress: deviceAddress);
+    vibrateBasedOnDistance(distance);
   }
 
   double calculateDistance(int rssi) {
-    // Ajustado para mejor precisión con ESP32
-    // txPower es la potencia de transmisión a 1 metro
     const int txPower = -59;
-    const double n = 2.0; // Factor de propagación (2.0 = espacio libre)
-    
-    if (rssi == 0) {
-      return -1.0; // Distancia desconocida
-    }
-    
-    // Fórmula: d = 10 ^ ((txPower - rssi) / (10 * n))
-    final double ratio = (txPower - rssi) / (10.0 * n);
-    return pow(10.0, ratio).toDouble();
+    return pow(10.0, (txPower - rssi) / 20.0).toDouble();
   }
 
-  String getDirectionForDevice(int rssi, int previousDeviceRssi, String deviceAddress) {
+  String getDirection(int rssi) {
     final currentTime = DateTime.now().millisecondsSinceEpoch;
-    
-    // Verificar si ha pasado suficiente tiempo para actualizar
     if (currentTime - lastDirectionUpdate < directionUpdateInterval) {
       return '';
     }
@@ -412,29 +414,24 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     lastDirectionUpdate = currentTime;
     String direction;
 
-    // Más sensible a cambios pequeños
-    final rssiDiff = rssi - previousDeviceRssi;
-    
-    if (rssiDiff > 5) {
-      direction = 'Acercándote, continúa';
-    } else if (rssiDiff < -5) {
-      direction = 'Te alejas, regresa';
-    } else if (rssiDiff > 2) {
-      direction = 'Bien, sigue así';
-    } else if (rssiDiff < -2) {
-      direction = 'Cambia de dirección';
-    } else if (rssiDiff >= -1 && rssiDiff <= 1) {
-      direction = 'Muy cerca';
+    if (rssi > previousRssi + 8) {
+      direction = 'sigue avanzando';
+    } else if (rssi < previousRssi - 8) {
+      direction = 'Te estás alejando';
+    } else if (rssi > previousRssi + 3) {
+      direction = 'continúa';
+    } else if (rssi < previousRssi - 3) {
+      direction = 'Te alejas';
     } else {
-      direction = 'Mantén rumbo';
+      direction = 'Mantén esta dirección';
     }
 
     previousRssi = rssi;
-    announceDirection(direction, deviceAddress: deviceAddress);
+    announceDirection(direction);
     return direction;
   }
 
-  void vibrateBasedOnDistance(double distance, {String? deviceAddress}) {
+  void vibrateBasedOnDistance(double distance) {
     if (!isScanning) {
       Vibration.cancel();
       return;
@@ -444,60 +441,38 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     String message;
 
     if (distance <= 0.5) {
-      pattern = [0, 50, 50, 50]; // Vibración muy rápida
+      pattern = [0, 200];
       message = 'Muy cerca';
     } else if (distance <= 1.0) {
       pattern = [0, 100, 100, 100];
-      message = 'Un metro';
+      message = 'A un metro';
     } else if (distance <= 2.0) {
-      pattern = [0, 150, 150, 150];
-      message = 'Dos metros';
-    } else if (distance <= 3.0) {
       pattern = [0, 200, 200, 200];
-      message = 'Tres metros';
-    } else if (distance <= 4.0) {
-      pattern = [0, 250, 250, 250];
-      message = 'Cuatro metros';
-    } else if (distance <= 6.0) {
+      message = 'A dos metros';
+    } else if (distance <= 3.0) {
       pattern = [0, 300, 300, 300];
-      message = 'Seis metros';
-    } else if (distance <= 10.0) {
+      message = 'A tres metros';
+    } else if (distance <= 4.0) {
       pattern = [0, 400, 400, 400];
-      message = 'Diez metros';
+      message = 'A cuatro metros';
+    } else if (distance <= 6.0) {
+      pattern = [0, 500, 500, 500];
+      message = 'A seis metros';
     } else {
-      // No vibrar si está muy lejos
+      Vibration.cancel();
       return;
     }
 
-    // Vibrar con patrón corto para respuesta rápida
-    Vibration.vibrate(pattern: pattern);
-    announceDistance(message, deviceAddress: deviceAddress);
+    Vibration.vibrate(pattern: pattern, repeat: 0);
+    announceDistance(message);
   }
 
-  void announceDistance(String message, {String? deviceAddress}) {
-    // Control de tiempo para evitar spam de voz
-    final currentTime = DateTime.now().millisecondsSinceEpoch;
-    final key = deviceAddress ?? 'general';
-    final lastTime = lastAnnouncementTime[key] ?? 0;
-    
-    // Anunciar cada medio segundo para actualizaciones rápidas
-    if (currentTime - lastTime >= 500) {
-      flutterTts.speak(message);
-      lastAnnouncementTime[key] = currentTime;
-    }
+  void announceDistance(String message) {
+    flutterTts.speak(message);
   }
 
-  void announceDirection(String direction, {String? deviceAddress}) {
-    // Control de tiempo para evitar spam de voz
-    final currentTime = DateTime.now().millisecondsSinceEpoch;
-    final key = deviceAddress ?? 'general_direction';
-    final lastTime = lastAnnouncementTime[key] ?? 0;
-    
-    // Anunciar cada medio segundo para actualizaciones rápidas
-    if (currentTime - lastTime >= 500) {
-      flutterTts.speak(direction);
-      lastAnnouncementTime[key] = currentTime;
-    }
+  void announceDirection(String direction) {
+    flutterTts.speak(direction);
   }
 
   Future<void> startLocationUpdates() async {
@@ -527,12 +502,18 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     try {
       final position = await Geolocator.getCurrentPosition();
       for (var device in devicesList) {
-        locationHistory.add(LocationRecord(
+        final locationRecord = LocationRecord(
           latitude: position.latitude,
           longitude: position.longitude,
           timestamp: DateTime.now().millisecondsSinceEpoch,
           deviceAddress: device.address,
-        ));
+        );
+        
+        locationHistory.add(locationRecord);
+        
+        _firebaseService.saveLocation(locationRecord).catchError((e) {
+          debugPrint('Error al guardar en Firebase: $e');
+        });
       }
 
       positionStream = Geolocator.getPositionStream(
@@ -543,13 +524,19 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       ).listen((Position position) {
         if (isScanning) {
           for (var device in devicesList) {
+            final locationRecord = LocationRecord(
+              latitude: position.latitude,
+              longitude: position.longitude,
+              timestamp: DateTime.now().millisecondsSinceEpoch,
+              deviceAddress: device.address,
+            );
+            
             setState(() {
-              locationHistory.add(LocationRecord(
-                latitude: position.latitude,
-                longitude: position.longitude,
-                timestamp: DateTime.now().millisecondsSinceEpoch,
-                deviceAddress: device.address,
-              ));
+              locationHistory.add(locationRecord);
+            });
+            
+            _firebaseService.saveLocation(locationRecord).catchError((e) {
+              debugPrint('Error al guardar en Firebase: $e');
             });
           }
           saveLocationHistory();
@@ -579,24 +566,71 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await prefs?.setString(deviceAddress, newName);
   }
 
-  void checkDeviceTimeout() {
-    final currentTime = DateTime.now().millisecondsSinceEpoch;
-    if (currentTime - lastDeviceDetectionTime > deviceTimeoutMs) {
-      // showOutOfRangeNotification();
-    }
-  }
-
-
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Sabueso'),
+        title: Row(
+          children: [
+            const Text('Sabueso'),
+            const SizedBox(width: 8),
+            if (isSyncing)
+              const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.cloud_upload),
+            onPressed: syncWithFirebase,
+            tooltip: 'Sincronizar con Firebase',
+          ),
+          IconButton(
+            icon: const Icon(Icons.info_outline),
+            onPressed: () => _showFirebaseInfo(context),
+            tooltip: 'Info de Firebase',
+          ),
+        ],
       ),
       body: showPermissionsDialog
           ? _buildPermissionsDialog()
           : _buildMainContent(),
+    );
+  }
+
+  void _showFirebaseInfo(BuildContext context) async {
+    final stats = await _firebaseService.getLocationStats();
+    final user = _firebaseService.currentUser;
+    
+    if (!mounted) return;
+    
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Información de Firebase'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Usuario: ${user?.uid ?? "No autenticado"}'),
+            const SizedBox(height: 8),
+            Text('Total de ubicaciones: ${stats['totalLocations'] ?? 0}'),
+            const SizedBox(height: 8),
+            Text('Dispositivos rastreados: ${(stats['devices'] as List?)?.length ?? 0}'),
+            const SizedBox(height: 8),
+            Text('Ubicaciones locales: ${locationHistory.length}'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cerrar'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -937,17 +971,28 @@ void startBackgroundCallback() {
 
 class BackgroundTaskHandler extends TaskHandler {
   @override
-  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async { // ✅ CORREGIDO
     debugPrint('Background service started');
   }
 
   @override
-  Future<void> onRepeatEvent(DateTime timestamp) async {
+  Future<void> onRepeatEvent(DateTime timestamp) async { // ✅ CORREGIDO
     debugPrint('Background task repeat event');
   }
 
   @override
   Future<void> onDestroy(DateTime timestamp) async {
     debugPrint('Background service destroyed');
+  }
+  
+  // ✅ MÉTODOS AGREGADOS (requeridos)
+  @override
+  void onNotificationButtonPressed(String id) {
+    debugPrint('Notification button pressed: $id');
+  }
+  
+  @override
+  void onNotificationPressed() {
+    debugPrint('Notification pressed');
   }
 }
