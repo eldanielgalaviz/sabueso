@@ -11,9 +11,25 @@ import 'dart:math';
 import 'dart:async';
 import 'dart:isolate';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:http/http.dart' as http;
+import 'package:geocoding/geocoding.dart' as geocoding;
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'firebase_options.dart';
 
-void main() {
+class ESP32Config {
+  static const String deviceName = "Rastreador Sabueso";
+  static const String serviceUUID = "12345678-1234-1234-1234-123456789abc";
+  static const String characteristicUUID = "87654321-4321-4321-4321-cba987654321";
+}
+
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
       channelId: 'sabueso_channel',
@@ -21,20 +37,15 @@ void main() {
       channelDescription: 'Servicio de escaneo en segundo plano',
       channelImportance: NotificationChannelImportance.HIGH,
       priority: NotificationPriority.HIGH,
-      iconData: const NotificationIconData(
-        resType: ResourceType.mipmap,
-        resPrefix: ResourcePrefix.ic,
-        name: 'launcher',
-      ),
     ),
     iosNotificationOptions: const IOSNotificationOptions(
       showNotification: true,
       playSound: false,
     ),
-    foregroundTaskOptions: const ForegroundTaskOptions(
-      interval: 5000,
-      isOnceEvent: false,
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.repeat(5000),
       autoRunOnBoot: true,
+      autoRunOnMyPackageReplaced: true,
       allowWakeLock: true,
       allowWifiLock: true,
     ),
@@ -49,8 +60,9 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Sabueso',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        primarySwatch: Colors.grey,
+        primarySwatch: Colors.blue,
         useMaterial3: true,
       ),
       home: const MainScreen(),
@@ -63,14 +75,26 @@ class LocationRecord {
   final double longitude;
   final int timestamp;
   final String deviceAddress;
+  final String? documentId;
 
   LocationRecord({
     required this.latitude,
     required this.longitude,
     required this.timestamp,
     required this.deviceAddress,
+    this.documentId,
   });
 
+  // Para Firestore (con serverTimestamp)
+  Map<String, dynamic> toFirestore() => {
+        'latitude': latitude,
+        'longitude': longitude,
+        'timestamp': timestamp,
+        'deviceAddress': deviceAddress,
+        'createdAt': FieldValue.serverTimestamp(),
+      };
+
+  // Para SharedPreferences (sin FieldValue)
   Map<String, dynamic> toJson() => {
         'latitude': latitude,
         'longitude': longitude,
@@ -84,6 +108,19 @@ class LocationRecord {
         timestamp: json['timestamp'],
         deviceAddress: json['deviceAddress'],
       );
+
+  factory LocationRecord.fromFirestore(
+    DocumentSnapshot<Map<String, dynamic>> snapshot,
+  ) {
+    final data = snapshot.data()!;
+    return LocationRecord(
+      latitude: data['latitude'],
+      longitude: data['longitude'],
+      timestamp: data['timestamp'],
+      deviceAddress: data['deviceAddress'],
+      documentId: snapshot.id,
+    );
+  }
 }
 
 class DeviceData {
@@ -92,6 +129,7 @@ class DeviceData {
   final int rssi;
   final double distance;
   final String direction;
+  final bool isESP32Sabueso;
 
   DeviceData({
     required this.name,
@@ -99,6 +137,7 @@ class DeviceData {
     required this.rssi,
     required this.distance,
     required this.direction,
+    this.isESP32Sabueso = false,
   });
 
   DeviceData copyWith({
@@ -107,6 +146,7 @@ class DeviceData {
     int? rssi,
     double? distance,
     String? direction,
+    bool? isESP32Sabueso,
   }) {
     return DeviceData(
       name: name ?? this.name,
@@ -114,6 +154,7 @@ class DeviceData {
       rssi: rssi ?? this.rssi,
       distance: distance ?? this.distance,
       direction: direction ?? this.direction,
+      isESP32Sabueso: isESP32Sabueso ?? this.isESP32Sabueso,
     );
   }
 }
@@ -127,22 +168,33 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   final FlutterTts flutterTts = FlutterTts();
-
+  final FirebaseFirestore firestore = FirebaseFirestore.instance;
 
   List<DeviceData> devicesList = [];
   List<LocationRecord> locationHistory = [];
   bool isScanning = false;
-  int previousRssi = 0;
-  int lastDirectionUpdate = 0;
+  bool isScanningForESP32 = false;
+  bool isFirestoreConnected = false;
+  
+  List<int> rssiHistory = []; 
+  int lastRssiUpdate = 0;
+  double currentDistance = 0.0;
+  String currentDirection = 'Calculando...';
+  
+  int updateCounter = 0; 
+  DateTime? lastUpdateTime; 
+  
   int lastDeviceDetectionTime = 0;
   SharedPreferences? prefs;
   StreamSubscription<Position>? positionStream;
   StreamSubscription<List<ScanResult>>? scanSubscription;
   Timer? vibrationTimer;
+  Timer? scanRestartTimer; 
   bool showPermissionsDialog = false;
+  String? activeDeviceAddress;
 
-  static const int directionUpdateInterval = 2000;
   static const int deviceTimeoutMs = 10000;
+  static const int rssiHistorySize = 5; 
 
   @override
   void initState() {
@@ -157,6 +209,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     stopScan();
     stopLocationUpdates();
     vibrationTimer?.cancel();
+    scanRestartTimer?.cancel(); 
     flutterTts.stop();
     saveLocationHistory();
     super.dispose();
@@ -169,465 +222,912 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> testFirestoreConnection() async {
+    try {
+      await firestore.collection('_test_connection').add({
+        'test': 'Prueba de conexión',
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+      
+      setState(() {
+        isFirestoreConnected = true;
+      });
+      
+      debugPrint('✅ Firebase conectado exitosamente');
+      
+      final testDocs = await firestore.collection('_test_connection').get();
+      for (var doc in testDocs.docs) {
+        await doc.reference.delete();
+      }
+      
+    } catch (e) {
+      setState(() {
+        isFirestoreConnected = false;
+      });
+      debugPrint('❌ Error de conexión a Firebase: $e');
+    }
+  }
+
+  Future<bool> saveLocationToFirestore(LocationRecord record) async {
+    try {
+      await firestore.collection('ubicaciones').add(record.toFirestore());
+      debugPrint('✅ Guardado en Firestore: ${record.latitude}, ${record.longitude}');
+      return true;
+    } catch (e) {
+      debugPrint('❌ Error al guardar en Firestore: $e');
+      return false;
+    }
+  }
+
+  Future<String> fetchWeatherAndAnnounce(Position position) async {
+    const apiKey = '5318481fd8a6f506fd7319722062cae3';
+    final lat = position.latitude;
+    final lon = position.longitude;
+    String city = 'tu ubicación';
+    String weatherMessage;
+
+    try {
+      List<geocoding.Placemark> placemarks =
+          await geocoding.placemarkFromCoordinates(lat, lon);
+      if (placemarks.isNotEmpty) {
+        city = placemarks.first.locality ?? placemarks.first.name ?? city;
+      }
+
+      final url = Uri.parse(
+          'https://api.openweathermap.org/data/2.5/weather?lat=$lat&lon=$lon&appid=$apiKey&units=metric&lang=es');
+      final response = await http.get(url);
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final description = data['weather'][0]['description'];
+        final temp = data['main']['temp'].toStringAsFixed(0);
+        weatherMessage =
+            'Bienvenido a Sabueso. El pronóstico del clima en $city es de $temp grados Celsius con $description.';
+      } else {
+        weatherMessage =
+            'Bienvenido a Sabueso. No se pudo obtener el pronóstico del clima para $city.';
+      }
+    } catch (e) {
+      debugPrint('Error al obtener el clima: $e');
+      weatherMessage = 'Bienvenido a Sabueso.';
+    }
+
+    await flutterTts.speak(weatherMessage);
+    return weatherMessage;
+  }
+
+  Future<void> searchForESP32Sabueso() async {
+    setState(() {
+      isScanningForESP32 = true;
+    });
+
+    try {
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+
+      scanSubscription =
+          FlutterBluePlus.scanResults.listen((List<ScanResult> results) {
+        for (ScanResult result in results) {
+          if (result.device.platformName == ESP32Config.deviceName) {
+            debugPrint(
+                'ESP32 Sabueso encontrado: ${result.device.remoteId}');
+
+            final exists = devicesList
+                .any((d) => d.address == result.device.remoteId.toString());
+
+            if (!exists) {
+              final newDevice = DeviceData(
+                name: ESP32Config.deviceName,
+                address: result.device.remoteId.toString(),
+                rssi: result.rssi,
+                distance: calculateDistance(result.rssi),
+                direction: 'Dispositivo encontrado',
+                isESP32Sabueso: true,
+              );
+
+              setState(() {
+                devicesList.insert(0, newDevice);
+              });
+
+              saveDevices();
+              flutterTts.speak('Rastreador Sabueso encontrado');
+              FlutterBluePlus.stopScan();
+              setState(() {
+                isScanningForESP32 = false;
+              });
+
+              return;
+            }
+          }
+        }
+      });
+
+      await Future.delayed(const Duration(seconds: 10));
+      await FlutterBluePlus.stopScan();
+
+      setState(() {
+        isScanningForESP32 = false;
+      });
+
+      if (!devicesList.any((d) => d.isESP32Sabueso)) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                  'No se encontró el Rastreador Sabueso ESP32. Asegúrate de que esté encendido.'),
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Error al buscar ESP32: $e');
+      setState(() {
+        isScanningForESP32 = false;
+      });
+    }
+  }
+
   Future<void> initializeApp() async {
     prefs = await SharedPreferences.getInstance();
     await loadLocationHistory();
+    await loadDevices();
     await initializeTTS();
     await checkPermissions();
-    await startBackgroundService();
-    
-    await Future.delayed(const Duration(milliseconds: 1));
-    if (mounted) {
-      await startScan();
-      await Future.delayed(const Duration(milliseconds: 1));
-      await stopScan();
+    await testFirestoreConnection();
+
+    try {
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.low,
+      );
+      await fetchWeatherAndAnnounce(position);
+    } catch (e) {
+      debugPrint('No se pudo obtener el clima: $e');
     }
   }
 
   Future<void> initializeTTS() async {
-    await flutterTts.setLanguage("es-ES");
+    await flutterTts.setLanguage('es-ES');
     await flutterTts.setSpeechRate(0.5);
     await flutterTts.setVolume(1.0);
     await flutterTts.setPitch(1.0);
   }
 
-
-
-  Future<void> startBackgroundService() async {
-    await FlutterForegroundTask.startService(
-      notificationTitle: 'Sabueso',
-      notificationText: 'Escaneando dispositivos...',
-      callback: startBackgroundCallback,
-    );
-  }
-
   Future<void> checkPermissions() async {
-    final bluetoothStatus = await Permission.bluetooth.status;
-    final bluetoothScanStatus = await Permission.bluetoothScan.status;
-    final bluetoothConnectStatus = await Permission.bluetoothConnect.status;
-    final locationStatus = await Permission.location.status;
+    final bluetoothStatus = await Permission.bluetoothScan.status;
+    final locationStatus = await Permission.locationWhenInUse.status;
+    final notificationStatus = await Permission.notification.status;
 
     if (!bluetoothStatus.isGranted ||
-        !bluetoothScanStatus.isGranted ||
-        !bluetoothConnectStatus.isGranted ||
-        !locationStatus.isGranted) {
-      await requestPermissions();
-    }
-
-    final isLocationEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!isLocationEnabled) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Por favor activa el GPS'),
-            duration: Duration(seconds: 3),
-          ),
-        );
-      }
-      await Geolocator.openLocationSettings();
+        !locationStatus.isGranted ||
+        !notificationStatus.isGranted) {
+      setState(() {
+        showPermissionsDialog = true;
+      });
     }
   }
 
   Future<void> requestPermissions() async {
-    final Map<Permission, PermissionStatus> statuses = await [
-      Permission.bluetooth,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.location,
-      Permission.locationWhenInUse,
-    ].request();
+    await Permission.bluetoothScan.request();
+    await Permission.bluetoothConnect.request();
+    await Permission.locationWhenInUse.request();
+    await Permission.notification.request();
 
-    if (statuses.values.any((status) => !status.isGranted)) {
-      setState(() {
-        showPermissionsDialog = true;
-      });
+    setState(() {
+      showPermissionsDialog = false;
+    });
+  }
+
+  double calculateDistance(int rssi) {
+    const int txPower = -59;
+    if (rssi == 0) return -1.0;
+    double ratio = rssi * 1.0 / txPower;
+    if (ratio < 1.0) {
+      return pow(ratio, 10).toDouble();
     } else {
-      await Permission.locationAlways.request();
+      return (0.89976) * pow(ratio, 7.7095) + 0.111;
     }
   }
 
-  Future<void> saveLocationHistory() async {
-    try {
-      final jsonList = locationHistory.map((e) => e.toJson()).toList();
-      await prefs?.setString('location_history', jsonEncode(jsonList));
-      debugPrint('Guardado exitoso: ${locationHistory.length} registros');
-    } catch (e) {
-      debugPrint('Error al guardar el historial: $e');
+  String calculateDirectionImproved(int currentRssi) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    rssiHistory.add(currentRssi);
+    
+    if (rssiHistory.length > rssiHistorySize) {
+      rssiHistory.removeAt(0);
     }
+    
+    if (rssiHistory.length < 3) {
+      return 'Calibrando...';
+    }
+    
+    final int mid = rssiHistory.length ~/ 2;
+    final double firstHalf = rssiHistory.sublist(0, mid).reduce((a, b) => a + b) / mid;
+    final double secondHalf = rssiHistory.sublist(mid).reduce((a, b) => a + b) / (rssiHistory.length - mid);
+    
+    final double trend = secondHalf - firstHalf;
+    
+    String direction;
+    if (trend > 3) {
+      direction = 'Te estás acercando ↑';
+    } else if (trend < -3) {
+      direction = 'Te estás alejando ↓';
+    } else {
+      direction = 'Distancia estable →';
+    }
+    
+    lastRssiUpdate = now;
+    return direction;
   }
 
-  Future<void> loadLocationHistory() async {
-    try {
-      final json = prefs?.getString('location_history');
-      if (json != null) {
-        final List<dynamic> decoded = jsonDecode(json);
-        setState(() {
-          locationHistory =
-              decoded.map((e) => LocationRecord.fromJson(e)).toList();
-        });
-        debugPrint('Historial cargado: ${locationHistory.length} registros');
-      }
-    } catch (e) {
-      debugPrint('Error al cargar el historial: $e');
+  void handleVibrationProportional(double distance) {
+    vibrationTimer?.cancel();
+
+    if (distance < 0) return;
+
+    int duration;
+    int amplitude;
+    int intervalMs;
+
+    if (distance < 0.5) {
+      duration = 200;
+      amplitude = 255; 
+      intervalMs = 100; 
+    } else if (distance < 1.0) {
+      duration = 150;
+      amplitude = 240;
+      intervalMs = 200;
+    } else if (distance < 2.0) {
+      duration = 120;
+      amplitude = 220;
+      intervalMs = 400;
+    } else if (distance < 3.0) {
+      duration = 100;
+      amplitude = 200;
+      intervalMs = 600;
+    } else if (distance < 5.0) {
+      duration = 80;
+      amplitude = 160;
+      intervalMs = 1000;
+    } else if (distance < 8.0) {
+      duration = 60;
+      amplitude = 120;
+      intervalMs = 1500;
+    } else if (distance < 12.0) {
+      duration = 40;
+      amplitude = 80;
+      intervalMs = 2000;
+    } else {
+      duration = 30;
+      amplitude = 50;
+      intervalMs = 3000;
     }
+
+    Vibration.vibrate(duration: duration, amplitude: amplitude);
+    
+    vibrationTimer = Timer(Duration(milliseconds: intervalMs), () {
+      handleVibrationProportional(distance);
+    });
   }
 
-  Future<void> startScan() async {
-    if (isScanning) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('El escaneo ya está en progreso')),
-      );
-      return;
-    }
+  Future<void> startScan(String deviceAddress) async {
+    if (isScanning) return;
+
+    rssiHistory.clear();
+    updateCounter = 0;
+    scanRestartTimer?.cancel();
+
+    setState(() {
+      isScanning = true;
+      activeDeviceAddress = deviceAddress;
+    });
+
+    debugPrint('Iniciando escaneo con auto-reinicio para: $deviceAddress');
 
     try {
-      setState(() {
-        isScanning = true;
+      scanRestartTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
+        if (!isScanning) {
+          timer.cancel();
+          return;
+        }
+
+        debugPrint('Auto-reiniciando escaneo para actualizar RSSI...');
+        
+        await FlutterBluePlus.stopScan();
+        await Future.delayed(const Duration(milliseconds: 100));
+        
+        await FlutterBluePlus.startScan();
+        debugPrint('Escaneo reiniciado');
       });
 
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
+      await FlutterBluePlus.startScan();
+      debugPrint('Escaneo BLE iniciado (con auto-reinicio cada 5s)');
 
-      scanSubscription = FlutterBluePlus.scanResults.listen((results) {
+      scanSubscription =
+          FlutterBluePlus.scanResults.listen((List<ScanResult> results) {
+        debugPrint('Escaneando... ${results.length} dispositivos detectados');
+        
         for (ScanResult result in results) {
-          if (result.device.platformName == 'Rastreador Sabueso') {
-            addDeviceToList(result);
+          if (result.device.remoteId.toString() == deviceAddress) {
+            final distance = calculateDistance(result.rssi);
+            final direction = calculateDirectionImproved(result.rssi);
+
+            updateCounter++;
+            lastUpdateTime = DateTime.now();
+
+            debugPrint('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+            debugPrint('RSSI actualizado: ${result.rssi}');
+            debugPrint('Distancia calculada: ${distance.toStringAsFixed(2)}m');
+            debugPrint('Dirección: $direction');
+            debugPrint('Histórico RSSI: $rssiHistory');
+            debugPrint('Actualización #$updateCounter');
+            debugPrint('Timestamp: ${lastUpdateTime?.toString().substring(11, 19)}');
+            debugPrint('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+            if (mounted) {
+              setState(() {
+                currentDistance = distance;
+                currentDirection = direction;
+                
+                devicesList = List.from(devicesList.map((device) {
+                  if (device.address == deviceAddress) {
+                    return DeviceData(
+                      name: device.name,
+                      address: device.address,
+                      rssi: result.rssi,
+                      distance: distance,
+                      direction: direction,
+                      isESP32Sabueso: device.isESP32Sabueso,
+                    );
+                  }
+                  return device;
+                }));
+              });
+              debugPrint('setState() ejecutado - UI actualizado');
+            }
+
+            handleVibrationProportional(distance);
+            debugPrint('Vibrando: distancia ${distance.toStringAsFixed(2)}m');
+            
             lastDeviceDetectionTime = DateTime.now().millisecondsSinceEpoch;
           }
         }
       });
 
-      await startLocationUpdates();
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Iniciando escaneo...')),
-        );
-      }
+      startLocationUpdates(deviceAddress);
     } catch (e) {
       debugPrint('Error al iniciar escaneo: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al iniciar escaneo: $e')),
-        );
-      }
     }
   }
 
   Future<void> stopScan() async {
     try {
       await FlutterBluePlus.stopScan();
-      await scanSubscription?.cancel();
-      await stopLocationUpdates();
-      Vibration.cancel();
-
+      scanSubscription?.cancel();
+      vibrationTimer?.cancel();
+      scanRestartTimer?.cancel(); 
+      rssiHistory.clear();
       setState(() {
         isScanning = false;
+        activeDeviceAddress = null;
       });
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Escaneo detenido')),
-        );
-      }
+      debugPrint('Escaneo detenido completamente');
     } catch (e) {
       debugPrint('Error al detener escaneo: $e');
     }
   }
 
-  void addDeviceToList(ScanResult result) {
-    final deviceAddress = result.device.remoteId.toString();
-    final rssi = result.rssi;
-    final distance = calculateDistance(rssi);
-    final direction = getDirection(rssi);
-    final savedName = getSavedDeviceName(deviceAddress);
+  void startLocationUpdates(String deviceAddress) {
+    stopLocationUpdates();
 
-    final device = DeviceData(
-      name: savedName,
-      address: deviceAddress,
-      rssi: rssi,
-      distance: distance,
-      direction: direction,
+    positionStream = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 10,
+      ),
+    ).listen((Position position) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - lastDeviceDetectionTime < deviceTimeoutMs) {
+        final record = LocationRecord(
+          latitude: position.latitude,
+          longitude: position.longitude,
+          timestamp: now,
+          deviceAddress: deviceAddress,
+        );
+
+        final savedToFirestore = await saveLocationToFirestore(record);
+        
+        if (savedToFirestore && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: const [
+                  Icon(Icons.cloud_done, color: Colors.white, size: 16),
+                  SizedBox(width: 8),
+                  Text('Guardado en Firebase'),
+                ],
+              ),
+              duration: const Duration(seconds: 1),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+
+        setState(() {
+          locationHistory.add(record);
+        });
+
+        saveLocationHistory();
+      }
+    });
+  }
+
+  void stopLocationUpdates() {
+    positionStream?.cancel();
+  }
+
+  Future<void> saveLocationHistory() async {
+    if (prefs == null) return;
+    final jsonData =
+        locationHistory.map((record) => jsonEncode(record.toJson())).toList();
+    await prefs!.setStringList('locationHistory', jsonData);
+  }
+
+  Future<void> loadLocationHistory() async {
+    if (prefs == null) return;
+    final jsonData = prefs!.getStringList('locationHistory') ?? [];
+    setState(() {
+      locationHistory = jsonData
+          .map((json) => LocationRecord.fromJson(jsonDecode(json)))
+          .toList();
+    });
+  }
+
+  Future<void> addDevice(String name, String address, {bool isESP32 = false}) async {
+    final newDevice = DeviceData(
+      name: name,
+      address: address,
+      rssi: 0,
+      distance: 0.0,
+      direction: 'Desconocida',
+      isESP32Sabueso: isESP32,
     );
 
     setState(() {
-      final existingIndex =
-          devicesList.indexWhere((d) => d.address == deviceAddress);
-      if (existingIndex != -1) {
-        devicesList[existingIndex] = device;
-      } else {
-        devicesList.add(device);
-      }
+      devicesList.add(newDevice);
     });
 
-    vibrateBasedOnDistance(distance);
+    await saveDevices();
   }
 
-  double calculateDistance(int rssi) {
-    const int txPower = -59;
-    return pow(10.0, (txPower - rssi) / 20.0).toDouble();
+  Future<void> removeDevice(String address) async {
+    setState(() {
+      devicesList.removeWhere((device) => device.address == address);
+      locationHistory.removeWhere((record) => record.deviceAddress == address);
+    });
+
+    await saveDevices();
+    await saveLocationHistory();
   }
 
-  String getDirection(int rssi) {
-    final currentTime = DateTime.now().millisecondsSinceEpoch;
-    if (currentTime - lastDirectionUpdate < directionUpdateInterval) {
-      return '';
-    }
-
-    lastDirectionUpdate = currentTime;
-    String direction;
-
-    if (rssi > previousRssi + 8) {
-      direction = 'sigue avanzando';
-    } else if (rssi < previousRssi - 8) {
-      direction = 'Te estás alejando';
-    } else if (rssi > previousRssi + 3) {
-      direction = 'continúa';
-    } else if (rssi < previousRssi - 3) {
-      direction = 'Te alejas';
-    } else {
-      direction = 'Mantén esta dirección';
-    }
-
-    previousRssi = rssi;
-    announceDirection(direction);
-    return direction;
+  Future<void> saveDevices() async {
+    if (prefs == null) return;
+    final deviceNames = devicesList
+        .map((device) =>
+            '${device.name}|${device.address}|${device.isESP32Sabueso}')
+        .toList();
+    await prefs!.setStringList('devices', deviceNames);
   }
 
-  void vibrateBasedOnDistance(double distance) {
-    if (!isScanning) {
-      Vibration.cancel();
-      return;
-    }
-
-    List<int> pattern;
-    String message;
-
-    if (distance <= 0.5) {
-      pattern = [0, 200];
-      message = 'Muy cerca';
-    } else if (distance <= 1.0) {
-      pattern = [0, 100, 100, 100];
-      message = 'A un metro';
-    } else if (distance <= 2.0) {
-      pattern = [0, 200, 200, 200];
-      message = 'A dos metros';
-    } else if (distance <= 3.0) {
-      pattern = [0, 300, 300, 300];
-      message = 'A tres metros';
-    } else if (distance <= 4.0) {
-      pattern = [0, 400, 400, 400];
-      message = 'A cuatro metros';
-    } else if (distance <= 6.0) {
-      pattern = [0, 500, 500, 500];
-      message = 'A seis metros';
-    } else {
-      Vibration.cancel();
-      return;
-    }
-
-    Vibration.vibrate(pattern: pattern, repeat: 0);
-    announceDistance(message);
-  }
-
-  void announceDistance(String message) {
-    flutterTts.speak(message);
-  }
-
-  void announceDirection(String direction) {
-    flutterTts.speak(direction);
-  }
-
-  Future<void> startLocationUpdates() async {
-    final isLocationEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!isLocationEnabled) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text('El GPS está desactivado. Por favor actívalo.')),
+  Future<void> loadDevices() async {
+    if (prefs == null) return;
+    final deviceNames = prefs!.getStringList('devices') ?? [];
+    setState(() {
+      devicesList = deviceNames.map((nameAddress) {
+        final parts = nameAddress.split('|');
+        final isESP32 = parts.length > 2 ? parts[2] == 'true' : false;
+        return DeviceData(
+          name: parts[0],
+          address: parts[1],
+          rssi: 0,
+          distance: 0.0,
+          direction: 'Desconocida',
+          isESP32Sabueso: isESP32,
         );
-      }
-      return;
-    }
+      }).toList();
+    });
+  }
 
-    final permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Se requieren permisos de ubicación')),
-        );
-      }
-      await requestPermissions();
-      return;
-    }
-
-    try {
-      final position = await Geolocator.getCurrentPosition();
-      for (var device in devicesList) {
-        locationHistory.add(LocationRecord(
-          latitude: position.latitude,
-          longitude: position.longitude,
-          timestamp: DateTime.now().millisecondsSinceEpoch,
-          deviceAddress: device.address,
-        ));
-      }
-
-      positionStream = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          distanceFilter: 5,
-        ),
-      ).listen((Position position) {
-        if (isScanning) {
-          for (var device in devicesList) {
-            setState(() {
-              locationHistory.add(LocationRecord(
-                latitude: position.latitude,
-                longitude: position.longitude,
-                timestamp: DateTime.now().millisecondsSinceEpoch,
-                deviceAddress: device.address,
-              ));
-            });
-          }
-          saveLocationHistory();
+  Future<void> editDeviceName(String address, String newName) async {
+    setState(() {
+      devicesList = devicesList.map((device) {
+        if (device.address == address) {
+          return device.copyWith(name: newName);
         }
-      });
+        return device;
+      }).toList();
+    });
 
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Seguimiento de ubicación iniciado')),
-        );
-      }
-    } catch (e) {
-      debugPrint('Error al acceder a la ubicación: $e');
-    }
+    await saveDevices();
   }
-
-  Future<void> stopLocationUpdates() async {
-    await positionStream?.cancel();
-    positionStream = null;
-  }
-
-  String getSavedDeviceName(String deviceAddress) {
-    return prefs?.getString(deviceAddress) ?? 'Rastreador Sabueso';
-  }
-
-  Future<void> saveDeviceName(String deviceAddress, String newName) async {
-    await prefs?.setString(deviceAddress, newName);
-  }
-
-  void checkDeviceTimeout() {
-    final currentTime = DateTime.now().millisecondsSinceEpoch;
-    if (currentTime - lastDeviceDetectionTime > deviceTimeoutMs) {
-      // showOutOfRangeNotification();
-    }
-  }
-
-
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Sabueso'),
-      ),
-      body: showPermissionsDialog
-          ? _buildPermissionsDialog()
-          : _buildMainContent(),
-    );
-  }
-
-  Widget _buildPermissionsDialog() {
-    return Center(
-      child: AlertDialog(
-        title: const Text('Permisos Requeridos'),
-        content: const Text(
-          'Esta aplicación necesita permisos de Bluetooth y ubicación para funcionar. '
-          'Por favor, otorga los permisos en la configuración de la aplicación.',
+    return WithForegroundTask(
+      child: Scaffold(
+        appBar: AppBar(
+          elevation: 0,
+          backgroundColor: Colors.blue.shade700,
+          title: Row(
+            children: [
+              const Icon(Icons.pets, size: 28),
+              const SizedBox(width: 12),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Sabueso',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      Icon(
+                        isFirestoreConnected
+                            ? Icons.cloud_done
+                            : Icons.cloud_off,
+                        size: 14,
+                        color: isFirestoreConnected
+                            ? Colors.greenAccent
+                            : Colors.redAccent,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        isFirestoreConnected ? 'Firebase OK' : 'Sin conexión',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w300,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ],
+          ),
+          actions: [
+            if (!isFirestoreConnected)
+              IconButton(
+                icon: const Icon(Icons.refresh),
+                onPressed: testFirestoreConnection,
+                tooltip: 'Reintentar conexión',
+              ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              setState(() {
-                showPermissionsDialog = false;
-              });
-            },
-            child: const Text('Cancelar'),
-          ),
-          TextButton(
-            onPressed: () async {
-              await openAppSettings();
-              setState(() {
-                showPermissionsDialog = false;
-              });
-            },
-            child: const Text('Ir a Configuración'),
-          ),
-        ],
+        body: Stack(
+          children: [
+            Column(
+              children: [
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [Colors.blue.shade700, Colors.blue.shade500],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      const Icon(
+                        Icons.bluetooth_searching,
+                        size: 56,
+                        color: Colors.white,
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'ESP32 Rastreador Sabueso',
+                        style: TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      ElevatedButton.icon(
+                        onPressed:
+                            isScanningForESP32 ? null : searchForESP32Sabueso,
+                        icon: Icon(isScanningForESP32
+                            ? Icons.hourglass_empty
+                            : Icons.search),
+                        label: Text(
+                          isScanningForESP32
+                              ? 'Buscando...'
+                              : 'Buscar Mi ESP32',
+                          style: const TextStyle(fontSize: 16),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          foregroundColor: Colors.blue.shade700,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 32, vertical: 14),
+                          elevation: 4,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Detecta automáticamente tu rastreador',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: Colors.white70,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+                Expanded(
+                  child: devicesList.isEmpty
+                      ? Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(32.0),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.bluetooth_disabled,
+                                    size: 64, color: Colors.grey.shade400),
+                                const SizedBox(height: 16),
+                                Text(
+                                  'No hay dispositivos agregados',
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    color: Colors.grey.shade600,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  'Busca tu ESP32 arriba o agrega dispositivos con el botón +',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    color: Colors.grey.shade500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
+                      : ListView.builder(
+                          padding: const EdgeInsets.all(16),
+                          itemCount: devicesList.length,
+                          itemBuilder: (context, index) {
+                            final device = devicesList[index];
+                            final deviceLocationHistory = locationHistory
+                                .where((record) =>
+                                    record.deviceAddress == device.address)
+                                .toList();
+
+                            return DeviceCard(
+                              device: device,
+                              locationHistory: deviceLocationHistory,
+                              isScanning: isScanning &&
+                                  activeDeviceAddress == device.address,
+                              onStartScan: () => startScan(device.address),
+                              onStopScan: stopScan,
+                              onRemove: () => removeDevice(device.address),
+                              onEditName: (newName) =>
+                                  editDeviceName(device.address, newName),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+            if (showPermissionsDialog)
+              Container(
+                color: Colors.black54,
+                child: Center(
+                  child: Card(
+                    margin: const EdgeInsets.all(32),
+                    child: Padding(
+                      padding: const EdgeInsets.all(24.0),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.warning,
+                              size: 48, color: Colors.orange),
+                          const SizedBox(height: 16),
+                          const Text(
+                            'Permisos Necesarios',
+                            style: TextStyle(
+                                fontSize: 20, fontWeight: FontWeight.bold),
+                          ),
+                          const SizedBox(height: 16),
+                          const Text(
+                            'Esta aplicación necesita permisos de Bluetooth, Ubicación y Notificaciones para funcionar correctamente.',
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 24),
+                          ElevatedButton(
+                            onPressed: requestPermissions,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blue.shade700,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 32, vertical: 14),
+                            ),
+                            child: const Text('Otorgar Permisos'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+        floatingActionButton: FloatingActionButton(
+          onPressed: () async {
+            final result = await showDialog<Map<String, String>>(
+              context: context,
+              builder: (context) => const AddDeviceDialog(),
+            );
+
+            if (result != null) {
+              await addDevice(result['name']!, result['address']!);
+            }
+          },
+          backgroundColor: Colors.blue.shade700,
+          child: const Icon(Icons.add),
+        ),
       ),
     );
   }
+}
 
-  Widget _buildMainContent() {
-    return Padding(
-      padding: const EdgeInsets.all(16.0),
-      child: Column(
-        children: [
-          if (devicesList.isEmpty) ...[
-            const SizedBox(height: 32),
-            const Text(
-              'No se encontraron dispositivos',
-              style: TextStyle(fontSize: 18),
+class AddDeviceDialog extends StatefulWidget {
+  const AddDeviceDialog({super.key});
+
+  @override
+  State<AddDeviceDialog> createState() => _AddDeviceDialogState();
+}
+
+class _AddDeviceDialogState extends State<AddDeviceDialog> {
+  final nameController = TextEditingController();
+  final addressController = TextEditingController();
+  List<ScanResult> scanResults = [];
+  bool isScanning = false;
+
+  @override
+  void dispose() {
+    nameController.dispose();
+    addressController.dispose();
+    FlutterBluePlus.stopScan();
+    super.dispose();
+  }
+
+  Future<void> startScan() async {
+    setState(() {
+      isScanning = true;
+      scanResults.clear();
+    });
+
+    try {
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
+
+      FlutterBluePlus.scanResults.listen((results) {
+        setState(() {
+          scanResults = results;
+        });
+      });
+
+      await Future.delayed(const Duration(seconds: 4));
+      await FlutterBluePlus.stopScan();
+
+      setState(() {
+        isScanning = false;
+      });
+    } catch (e) {
+      debugPrint('Error al escanear: $e');
+      setState(() {
+        isScanning = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Agregar Dispositivo'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameController,
+              decoration: const InputDecoration(
+                labelText: 'Nombre del Dispositivo',
+                hintText: 'Ej: Mi AirTag',
+              ),
             ),
             const SizedBox(height: 16),
-            SizedBox(
-              width: 200,
-              height: 48,
-              child: ElevatedButton(
-                onPressed: () async {
-                  await startScan();
-                  await startLocationUpdates();
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.black,
-                  foregroundColor: Colors.white,
+            TextField(
+              controller: addressController,
+              decoration: const InputDecoration(
+                labelText: 'Dirección MAC',
+                hintText: 'XX:XX:XX:XX:XX:XX',
+              ),
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: isScanning ? null : startScan,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blue.shade700,
+                foregroundColor: Colors.white,
+              ),
+              child: Text(isScanning ? 'Escaneando...' : 'Escanear Dispositivos'),
+            ),
+            if (scanResults.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              const Text('Dispositivos Encontrados:',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 200,
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: scanResults.length,
+                  itemBuilder: (context, index) {
+                    final result = scanResults[index];
+                    final deviceName = result.device.platformName.isNotEmpty
+                        ? result.device.platformName
+                        : 'Dispositivo Desconocido';
+
+                    return ListTile(
+                      title: Text(deviceName),
+                      subtitle: Text(result.device.remoteId.toString()),
+                      trailing: deviceName == ESP32Config.deviceName
+                          ? const Icon(Icons.star, color: Colors.blue)
+                          : null,
+                      onTap: () {
+                        nameController.text = deviceName;
+                        addressController.text =
+                            result.device.remoteId.toString();
+                      },
+                    );
+                  },
                 ),
-                child: const Text('Iniciar Búsqueda'),
               ),
-            ),
-          ] else
-            Expanded(
-              child: ListView.builder(
-                itemCount: devicesList.length,
-                itemBuilder: (context, index) {
-                  return DeviceCard(
-                    device: devicesList[index],
-                    locationHistory: locationHistory
-                        .where((loc) =>
-                            loc.deviceAddress == devicesList[index].address)
-                        .toList(),
-                    isScanning: isScanning,
-                    onEditName: (newName) {
-                      final device = devicesList[index];
-                      setState(() {
-                        devicesList[index] = device.copyWith(name: newName);
-                      });
-                      saveDeviceName(device.address, newName);
-                    },
-                    onStartScan: () async {
-                      await startScan();
-                      await startLocationUpdates();
-                    },
-                    onStopScan: () async {
-                      await stopScan();
-                      await stopLocationUpdates();
-                    },
-                  );
-                },
-              ),
-            ),
-        ],
+            ],
+          ],
+        ),
       ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancelar'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            if (nameController.text.isNotEmpty &&
+                addressController.text.isNotEmpty) {
+              Navigator.pop(context, {
+                'name': nameController.text,
+                'address': addressController.text,
+              });
+            }
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.blue.shade700,
+            foregroundColor: Colors.white,
+          ),
+          child: const Text('Agregar'),
+        ),
+      ],
     );
   }
 }
@@ -636,15 +1136,17 @@ class DeviceCard extends StatefulWidget {
   final DeviceData device;
   final List<LocationRecord> locationHistory;
   final bool isScanning;
-  final Function(String) onEditName;
   final VoidCallback onStartScan;
   final VoidCallback onStopScan;
+  final VoidCallback onRemove;
+  final Function(String) onEditName;
 
   const DeviceCard({
     super.key,
     required this.device,
     required this.locationHistory,
     required this.isScanning,
+    required this.onRemove,
     required this.onEditName,
     required this.onStartScan,
     required this.onStopScan,
@@ -674,13 +1176,42 @@ class _DeviceCardState extends State<DeviceCard> {
   @override
   Widget build(BuildContext context) {
     return Card(
-      elevation: 8,
-      margin: const EdgeInsets.symmetric(vertical: 4),
+      elevation: 6,
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      color: widget.device.isESP32Sabueso ? Colors.blue.shade50 : null,
       child: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (widget.device.isESP32Sabueso)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [Colors.blue.shade600, Colors.blue.shade400],
+                  ),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.star, size: 16, color: Colors.white),
+                    SizedBox(width: 6),
+                    Text(
+                      'ESP32 Oficial',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            if (widget.device.isESP32Sabueso) const SizedBox(height: 12),
+
             if (isEditing) ...[
               TextField(
                 controller: nameController,
@@ -699,7 +1230,7 @@ class _DeviceCardState extends State<DeviceCard> {
                     });
                   },
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.black,
+                    backgroundColor: Colors.blue.shade700,
                     foregroundColor: Colors.white,
                   ),
                   child: const Text('Guardar'),
@@ -707,11 +1238,19 @@ class _DeviceCardState extends State<DeviceCard> {
               ),
             ] else ...[
               Row(
-                mainAxisAlignment: MainAxisAlignment.end,
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
+                  Expanded(
+                    child: Text(
+                      widget.device.name,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
                   SizedBox(
-                    width: 105,
-                    height: 45,
+                    height: 36,
                     child: ElevatedButton(
                       onPressed: () {
                         setState(() {
@@ -719,7 +1258,7 @@ class _DeviceCardState extends State<DeviceCard> {
                         });
                       },
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.black,
+                        backgroundColor: Colors.blue.shade700,
                         foregroundColor: Colors.white,
                       ),
                       child: const Text('Editar'),
@@ -727,51 +1266,90 @@ class _DeviceCardState extends State<DeviceCard> {
                   ),
                 ],
               ),
-              Text(
-                widget.device.name,
-                style: Theme.of(context).textTheme.titleMedium,
+              const SizedBox(height: 12),
+              
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.straighten, size: 20, color: Colors.blue),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Distancia: ${widget.device.distance.toStringAsFixed(2)} m',
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Icon(Icons.navigation, size: 20, color: Colors.blue),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            widget.device.direction,
+                            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Icon(Icons.radio_button_checked, size: 20, color: Colors.orange),
+                        const SizedBox(width: 8),
+                        Text(
+                          'RSSI: ${widget.device.rssi} dBm',
+                          style: const TextStyle(fontSize: 14, color: Colors.grey),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
-              const SizedBox(height: 4),
-              Text(
-                'Distancia estimada: ${widget.device.distance.toStringAsFixed(2)} metros',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-              Text(
-                'Dirección: ${widget.device.direction}',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-              const SizedBox(height: 8),
+              
+              const SizedBox(height: 12),
               SizedBox(
                 width: double.infinity,
-                height: 40,
-                child: ElevatedButton(
-                  onPressed:
-                      widget.isScanning ? widget.onStopScan : widget.onStartScan,
+                height: 48,
+                child: ElevatedButton.icon(
+                  onPressed: widget.isScanning
+                      ? widget.onStopScan
+                      : widget.onStartScan,
+                  icon: Icon(widget.isScanning ? Icons.stop : Icons.play_arrow),
+                  label: Text(
+                    widget.isScanning ? 'Detener Rastreo' : 'Iniciar Rastreo',
+                    style: const TextStyle(fontSize: 16),
+                  ),
                   style: ElevatedButton.styleFrom(
                     backgroundColor:
-                        widget.isScanning ? Colors.red : Colors.black,
+                        widget.isScanning ? Colors.red : Colors.green,
                     foregroundColor: Colors.white,
-                  ),
-                  child: Text(
-                    widget.isScanning ? 'Detener Escaneo' : 'Iniciar Escaneo',
                   ),
                 ),
               ),
               const SizedBox(height: 8),
               SizedBox(
                 width: double.infinity,
-                child: ElevatedButton(
+                child: ElevatedButton.icon(
                   onPressed: () {
                     setState(() {
                       showLocationHistory = true;
                     });
                   },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.black,
-                    foregroundColor: Colors.white,
+                  icon: const Icon(Icons.history),
+                  label: Text(
+                    'Ver Historial (${widget.locationHistory.length})',
                   ),
-                  child: Text(
-                    'Ver Historial de Ubicaciones (${widget.locationHistory.length})',
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue.shade700,
+                    foregroundColor: Colors.white,
                   ),
                 ),
               ),
@@ -827,36 +1405,77 @@ class LocationHistoryDialog extends StatelessWidget {
                     final record = locationHistory[index];
                     final date = DateTime.fromMillisecondsSinceEpoch(
                         record.timestamp);
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Fecha: ${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year} ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}:${date.second.toString().padLeft(2, '0')}',
+                    return Card(
+                      elevation: 2,
+                      margin: const EdgeInsets.symmetric(vertical: 4),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year} ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}:${date.second.toString().padLeft(2, '0')}',
+                              style: const TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                            const SizedBox(height: 4),
+                            Text('Lat: ${record.latitude}'),
+                            Text('Long: ${record.longitude}'),
+                            const SizedBox(height: 8),
+                            ElevatedButton.icon(
+                              onPressed: () async {
+                                final url = Uri.parse(
+                                  'https://www.google.com/maps?q=${record.latitude},${record.longitude}',
+                                );
+                                
+                                try {
+                                  final mapsUrl = Uri.parse(
+                                    'geo:${record.latitude},${record.longitude}?q=${record.latitude},${record.longitude}',
+                                  );
+                                  
+                                  if (await canLaunchUrl(mapsUrl)) {
+                                    await launchUrl(
+                                      mapsUrl,
+                                      mode: LaunchMode.externalApplication,
+                                    );
+                                  } else {
+                                    await launchUrl(
+                                      url,
+                                      mode: LaunchMode.externalApplication,
+                                    );
+                                  }
+                                } catch (e) {
+                                  debugPrint('Error al abrir Maps: $e');
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(
+                                        content: Text('No se pudo abrir Google Maps'),
+                                        backgroundColor: Colors.red,
+                                      ),
+                                    );
+                                  }
+                                }
+                              },
+                              icon: const Icon(Icons.map, size: 16),
+                              label: const Text('Ver en Maps'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.blue.shade700,
+                                foregroundColor: Colors.white,
+                              ),
+                            ),
+                          ],
                         ),
-                        Text('Lat: ${record.latitude}'),
-                        Text('Long: ${record.longitude}'),
-                        TextButton(
-                          onPressed: () async {
-                            final url = Uri.parse(
-                              'https://www.google.com/maps/search/?api=1&query=${record.latitude},${record.longitude}',
-                            );
-                            if (await canLaunchUrl(url)) {
-                              await launchUrl(url);
-                            }
-                          },
-                          child: const Text(
-                            'Ver en Google Maps',
-                            style: TextStyle(color: Colors.blue),
-                          ),
-                        ),
-                        const Divider(),
-                      ],
+                      ),
                     );
                   },
                 ),
               ),
-              TextButton(
+              const SizedBox(height: 16),
+              ElevatedButton(
                 onPressed: onDismiss,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blue.shade700,
+                  foregroundColor: Colors.white,
+                ),
                 child: const Text('Cerrar'),
               ),
             ],
@@ -874,17 +1493,17 @@ void startBackgroundCallback() {
 
 class BackgroundTaskHandler extends TaskHandler {
   @override
-  Future<void> onStart(DateTime timestamp, SendPort? sendPort) async {
-    debugPrint('Background service started');
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    debugPrint('Background service started at $timestamp');
   }
 
   @override
-  void onRepeatEvent(DateTime timestamp, SendPort? sendPort) {
-    debugPrint('Background task repeat event');
+  Future<void> onRepeatEvent(DateTime timestamp) async {
+    debugPrint('Background task repeat event at $timestamp');
   }
 
   @override
-  Future<void> onDestroy(DateTime timestamp, SendPort? sendPort) async {
-    debugPrint('Background service destroyed');
+  Future<void> onDestroy(DateTime timestamp) async {
+    debugPrint('Background service destroyed at $timestamp');
   }
 }

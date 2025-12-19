@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "565182076250",
+    "project_id": "sabueso-acc3c",
+    "storage_bucket": "sabueso-acc3c.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:565182076250:android:f7ae4bae53d98efbc94f63",
+        "android_client_info": {
+          "package_name": "com.example.sabueso"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBzjNcGCvGvoEqC0ndkWhtwItC76J7nFK8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
